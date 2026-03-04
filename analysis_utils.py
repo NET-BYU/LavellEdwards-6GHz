@@ -127,17 +127,22 @@ def descriptive(arr: np.ndarray) -> dict:
 
 
 def bootstrap_median_ci(a: np.ndarray, b: np.ndarray,
-                        n_boot: int = 5000, rng_seed: int = 42) -> tuple:
+                        n_boot: int = 5000, rng_seed: int = 42,
+                        max_sample: int = 10_000) -> tuple:
     """
     Bootstrap 95% CI for (median(b) - median(a)).
     Returns (observed_diff, ci_low, ci_high).
+    Arrays larger than max_sample are randomly subsampled before bootstrapping
+    to keep runtime reasonable (median CI stable above ~5K observations).
     """
     rng = np.random.default_rng(rng_seed)
     observed = np.median(b) - np.median(a)
+    a_boot = a if len(a) <= max_sample else rng.choice(a, size=max_sample, replace=False)
+    b_boot = b if len(b) <= max_sample else rng.choice(b, size=max_sample, replace=False)
     diffs = np.empty(n_boot)
     for i in range(n_boot):
-        sa = rng.choice(a, size=len(a), replace=True)
-        sb = rng.choice(b, size=len(b), replace=True)
+        sa = rng.choice(a_boot, size=len(a_boot), replace=True)
+        sb = rng.choice(b_boot, size=len(b_boot), replace=True)
         diffs[i] = np.median(sb) - np.median(sa)
     ci_low  = float(np.percentile(diffs, 2.5))
     ci_high = float(np.percentile(diffs, 97.5))
@@ -161,11 +166,17 @@ def cohens_d(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def cliffs_delta(a: np.ndarray, b: np.ndarray) -> float:
-    """Cliff's delta (non-parametric effect size, positive = b > a)."""
+    """Cliff's delta (non-parametric effect size, positive = b > a).
+    
+    Uses the Mann-Whitney U relationship: δ = 2*U/(na*nb) - 1
+    where U counts pairs where b > a (O(n log n), not O(n*m)).
+    """
     na, nb = len(a), len(b)
-    dom = sum(1 if bi > ai else (-1 if bi < ai else 0)
-              for bi in b for ai in a)
-    return dom / (na * nb)
+    if na == 0 or nb == 0:
+        return float("nan")
+    # mannwhitneyu(b, a) U-stat counts pairs where b[j] > a[i] (ties = 0.5)
+    u_b_gt_a, _ = stats.mannwhitneyu(b, a, alternative="greater")
+    return float(2 * u_b_gt_a / (na * nb) - 1)
 
 
 def effect_label_d(d: float) -> str:
