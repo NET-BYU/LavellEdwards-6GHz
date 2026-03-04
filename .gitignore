@@ -1,4 +1,3 @@
-*.duckdb
 **.venv**
 outputs/**
 __pycache__/**
