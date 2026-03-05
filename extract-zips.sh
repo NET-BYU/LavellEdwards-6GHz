@@ -1,14 +1,12 @@
 #!/bin/bash
-# Script to extract all zip files into corresponding folders
-# and move the zip files to keep them out of the way
+# Script to extract zip files from the zips/ folder into the data/ folder
 #
-# Usage: ./extract-zips.sh
+# Usage: ./extract-zips.sh [KEYWORD]
 #
 # This script will:
-# 1. Find all *.zip files in the current directory
-# 2. Create a folder for each zip (named after the zip file)
+# 1. Find all *.zip files in the zips/ folder (optionally filtered by KEYWORD)
+# 2. Create a folder under data/ for each zip (named after the zip file)
 # 3. Extract the contents into that folder
-# 4. Move the zip file to an 'archives' folder
 
 # Color codes for output
 RED='\033[0;31m'
@@ -16,59 +14,71 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# Count zip files in current directory
+KEYWORD="${1:-}"
+ZIPS_DIR="./zips"
+DATA_DIR="./data"
+
+if [ ! -d "$ZIPS_DIR" ]; then
+    echo -e "${RED}ERROR: zips/ folder not found.${NC}"
+    exit 1
+fi
+
+# Collect matching zip files
 shopt -s nullglob
-zip_files=(*.zip)
+all_zips=("$ZIPS_DIR"/*.zip)
 shopt -u nullglob
 
+if [ -n "$KEYWORD" ]; then
+    zip_files=()
+    for f in "${all_zips[@]}"; do
+        [[ "$(basename "$f")" == *"$KEYWORD"* ]] && zip_files+=("$f")
+    done
+    echo "Filtering for keyword: '$KEYWORD'"
+else
+    zip_files=("${all_zips[@]}")
+fi
+
 if [ ${#zip_files[@]} -eq 0 ]; then
-    echo "No zip files found in the current directory."
+    if [ -n "$KEYWORD" ]; then
+        echo "No zip files matching '$KEYWORD' found in zips/."
+    else
+        echo "No zip files found in zips/."
+    fi
     exit 0
 fi
 
 echo "Found ${#zip_files[@]} zip file(s) to process..."
 
-# Create archives folder if it doesn't exist
-archive_folder="./archives"
-if [ ! -d "$archive_folder" ]; then
-    mkdir -p "$archive_folder"
-    echo "Created 'archives' folder for storing zip files."
-fi
+# Ensure data/ folder exists
+mkdir -p "$DATA_DIR"
 
 # Process each zip file
 for zip_file in "${zip_files[@]}"; do
-    # Get the filename without extension
-    folder_name="${zip_file%.zip}"
-    destination_path="./$folder_name"
-    
+    base="$(basename "$zip_file")"
+    folder_name="${base%.zip}"
+    destination_path="$DATA_DIR/$folder_name"
+
     echo ""
-    echo "Processing: $zip_file"
-    
+    echo "Processing: $base"
+
     # Create the destination folder if it doesn't exist
     if [ ! -d "$destination_path" ]; then
         mkdir -p "$destination_path"
-        echo "  Created folder: $folder_name"
+        echo "  Created folder: data/$folder_name"
     else
-        echo "  Folder already exists: $folder_name"
+        echo "  Folder already exists: data/$folder_name"
     fi
-    
+
     # Extract the zip file
     if unzip -q -o "$zip_file" -d "$destination_path"; then
-        echo -e "  ${GREEN}Extracted successfully to: $folder_name${NC}"
-        
-        # Move the zip file to archives folder
-        if mv "$zip_file" "$archive_folder/"; then
-            echo "  Moved zip to: archives/$zip_file"
-        else
-            echo -e "  ${YELLOW}WARNING: Could not move $zip_file to archives${NC}"
-        fi
+        echo -e "  ${GREEN}Extracted successfully to: data/$folder_name${NC}"
     else
-        echo -e "  ${RED}ERROR: Failed to extract $zip_file${NC}"
+        echo -e "  ${RED}ERROR: Failed to extract $base${NC}"
     fi
 done
 
 echo ""
-echo "All done! Zip files have been moved to the 'archives' folder."
+echo "All done!"
 
 # Format extracted .txt files to .json
 echo ""

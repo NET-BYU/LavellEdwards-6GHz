@@ -4,7 +4,7 @@ Script to rename .txt files to .json and format them for readability
 Usage: python3 format_json_files.py [--name <keyword>]
 
 Options:
-  --name <keyword>    Use custom folder keyword (default: 'Section')
+  --name <keyword>    Only process folders whose name contains keyword (default: all folders)
 """
 
 import json
@@ -18,23 +18,30 @@ BLUE = '\033[0;34m'
 RED = '\033[0;31m'
 NC = '\033[0m'  # No Color
 
-def format_and_rename_files(folder_keyword='Section'):
-    """Find all .txt files in section folders and convert them to formatted JSON."""
+def format_and_rename_files(folder_keyword=None):
+    """Find all .txt files in data/ subfolders and convert them to formatted JSON."""
     
     print(f"{BLUE}Starting JSON file renaming and formatting...{NC}")
-    print(f"{BLUE}Using folder keyword: {folder_keyword}{NC}")
+    if folder_keyword:
+        print(f"{BLUE}Using folder keyword: {folder_keyword}{NC}")
+    else:
+        print(f"{BLUE}Processing all folders{NC}")
     
     # Statistics
     total_files = 0
     successful_files = 0
     failed_files = 0
     
-    # Get the current directory
-    root_dir = Path.cwd()
+    # Look inside the data/ folder
+    root_dir = Path.cwd() / "data"
     
-    # Find all directories matching the section pattern
+    if not root_dir.exists():
+        print(f"{RED}data/ folder not found. Make sure you're running this from the project root.{NC}")
+        return
+    
+    # Find all directories (optionally filtered by keyword)
     for section_dir in sorted(root_dir.iterdir()):
-        if section_dir.is_dir() and folder_keyword in section_dir.name:
+        if section_dir.is_dir() and (not folder_keyword or folder_keyword in section_dir.name):
             data_dir = section_dir / "data"
             
             # Check if data directory exists
@@ -82,11 +89,11 @@ def format_and_rename_files(folder_keyword='Section'):
     if successful_files > 0:
         print(f"\n{GREEN}All done! Files have been renamed to .json and formatted for readability.{NC}")
     else:
-        print(f"\n{RED}No files were processed. Make sure you're running this from the StadiumAnalysis directory.{NC}")
+        print(f"\n{RED}No files were processed. Make sure you're running this from the root directory.{NC}")
 
 def main():
     # Parse --name flag
-    folder_keyword = 'Section'
+    folder_keyword = None
     if len(sys.argv) > 1:
         if sys.argv[1] in ['-h', '--help']:
             print(__doc__)
