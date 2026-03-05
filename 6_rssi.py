@@ -129,8 +129,11 @@ def run(db_path: Path) -> None:
 
     # ------------------------------------------------------------------
     subheader("6.1d  Per-Game RSSI Breakdown")
-    games = sorted(set(game_arr.get("5GHz", {}).keys()) |
-                   set(game_arr.get("6GHz", {}).keys()))
+    games = sorted(
+        k for k in set(game_arr.get("5GHz", {}).keys()) |
+                   set(game_arr.get("6GHz", {}).keys())
+        if k is not None
+    )
     print(f"\n  {'Game':<6} {'Band':<6} {'N':>7} {'Median':>8} {'Mean':>8} {'Std':>7} {'IQR':>7}")
     print(f"  {'-'*6} {'-'*6} {'-'*7} {'-'*8} {'-'*8} {'-'*7} {'-'*7}")
     for g in games:

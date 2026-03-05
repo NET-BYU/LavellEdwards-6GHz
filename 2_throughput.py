@@ -76,7 +76,10 @@ def run(db_path: Path) -> None:
     arr6_t = all_arr(data, "6GHz", "tput")
     arr5_r = all_arr(data, "5GHz", "rssi")
     arr6_r = all_arr(data, "6GHz", "rssi")
-    games  = sorted(set(data["5GHz"].keys()) | set(data["6GHz"].keys()))
+    games  = sorted(
+        (k for k in set(data["5GHz"].keys()) | set(data["6GHz"].keys())
+         if k is not None)
+    )
 
     header("SECTION 2 — THROUGHPUT PERFORMANCE")
     print(f"  Source  : iperf TCP download intervals joined to connected AP")

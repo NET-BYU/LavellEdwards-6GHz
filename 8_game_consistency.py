@@ -191,7 +191,7 @@ def run(db_path: Path) -> None:
                 directions.append("N/A")
             else:
                 d = np.median(a6) - np.median(a5)
-                directions.append(f"+{d:+.3f}" if d >= 0 else f"{d:+.3f}")
+                directions.append(f"{d:+.3f}")
         if "N/A" in directions:
             consistent = "N/A"
         else:

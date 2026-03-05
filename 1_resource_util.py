@@ -39,6 +39,18 @@ FROM wifi_beacons w
 WHERE w.ch_util >= 0 AND w.band = '2.4GHz'
 """
 
+QUERY_LOAD_VS_EMPTY = """
+SELECT
+    s.campaign_type,
+    w.band,
+    w.ch_util
+FROM wifi_beacons w
+JOIN snapshots s ON w.snapshot_id = s.snapshot_id
+WHERE w.ch_util >= 0
+  AND w.band IN ('5GHz', '6GHz')
+  AND s.campaign_type IN ('game', 'empty')
+"""
+
 
 def load(con) -> dict:
     rows = con.execute(QUERY_OVERALL).fetchall()
@@ -49,6 +61,16 @@ def load(con) -> dict:
             for b, games in data.items()}
 
 
+def load_load_vs_empty(con) -> dict:
+    """Returns {campaign_type: {band: np.array}}."""
+    rows = con.execute(QUERY_LOAD_VS_EMPTY).fetchall()
+    data = {}
+    for campaign, band, val in rows:
+        data.setdefault(campaign, {}).setdefault(band, []).append(val)
+    return {c: {b: np.array(v) for b, v in bands.items()}
+            for c, bands in data.items()}
+
+
 def all_values(data: dict, band: str) -> np.ndarray:
     arrays = list(data[band].values())
     return np.concatenate(arrays)
@@ -56,13 +78,15 @@ def all_values(data: dict, band: str) -> np.ndarray:
 
 def run(db_path: Path) -> None:
     con = duckdb.connect(str(db_path), read_only=True)
-    data = load(con)
-    arr24 = np.array([r[0] for r in con.execute(QUERY_2_4).fetchall()])
+    data          = load(con)
+    arr24         = np.array([r[0] for r in con.execute(QUERY_2_4).fetchall()])
+    lve           = load_load_vs_empty(con)
     con.close()
 
     arr5 = all_values(data, "5GHz")
     arr6 = all_values(data, "6GHz")
-    games = sorted(set(data["5GHz"].keys()) | set(data["6GHz"].keys()))
+    games = sorted((g for g in set(data["5GHz"].keys()) | set(data["6GHz"].keys())
+                    if g is not None))
 
     header("SECTION 1 — BAND-LEVEL RESOURCE UTILIZATION")
     print(f"  Metric: Channel Utilization (0.0 = idle, 1.0 = fully occupied)")
@@ -180,6 +204,128 @@ def run(db_path: Path) -> None:
         pct5 = np.mean(fn(arr5)) * 100
         pct6 = np.mean(fn(arr6)) * 100
         print(f"  {label:<25} {pct5:>9.1f}%  {pct6:>9.1f}%")
+
+    # ------------------------------------------------------------------
+    subheader("1.7  Utilization Under Load vs Empty Stadium")
+    print("""
+  Compares channel utilization observed during live games ('game' campaign)
+  against the empty-stadium baseline ('empty' campaign) for 5 GHz and 6 GHz.
+  The interaction effect tests whether the 6GHz advantage over 5GHz grows
+  or shrinks under stadium load relative to idle conditions.
+""")
+
+    BANDS = ("5GHz", "6GHz")
+    CONDITIONS = (("game", "Game-day (loaded)"), ("empty", "Empty stadium (idle)"))
+
+    # --- Descriptive table ---
+    desc_hdr = ["Condition", "Band", "N", "Median", "Mean", "Std", "IQR", "P25", "P75"]
+    desc_tbl = []
+    for ctype, clabel in CONDITIONS:
+        for band in BANDS:
+            arr = lve.get(ctype, {}).get(band, np.array([]))
+            if len(arr) == 0:
+                desc_tbl.append([clabel, band, 0] + ["N/A"] * 6)
+                continue
+            d = descriptive(arr)
+            desc_tbl.append([
+                clabel, band, f"{d['n']:,}",
+                f"{d['median']:.4f}", f"{d['mean']:.4f}",
+                f"{d['std']:.4f}",   f"{d['iqr']:.4f}",
+                f"{d['p25']:.4f}",   f"{d['p75']:.4f}",
+            ])
+    print()
+    print_table(desc_hdr, desc_tbl)
+
+    # --- Per-band: game vs empty ---
+    print()
+    for band in BANDS:
+        arr_game  = lve.get("game",  {}).get(band, np.array([]))
+        arr_empty = lve.get("empty", {}).get(band, np.array([]))
+        if len(arr_game) == 0 or len(arr_empty) == 0:
+            print(f"  Insufficient data for {band}.")
+            continue
+
+        subheader(f"1.7  {band}: Game-Day vs Empty Stadium")
+        m_game  = np.median(arr_game)
+        m_empty = np.median(arr_empty)
+        diff    = m_game - m_empty
+        pct     = diff / m_empty * 100 if m_empty != 0 else float("nan")
+        print(f"\n  Median utilization  — game-day : {m_game:.4f}")
+        print(f"  Median utilization  — empty    : {m_empty:.4f}")
+        print(f"  Absolute difference (game - empty) : {diff:+.4f} ({diff*100:+.2f} pp)")
+        print(f"  Relative change                    : {pct:+.1f}%")
+
+        obs, ci_lo, ci_hi = bootstrap_median_ci(arr_empty, arr_game)
+        print(f"\n  Bootstrap 95% CI for median diff (game - empty):")
+        print(f"    Observed : {obs:+.4f}")
+        print(f"    CI       : [{ci_lo:+.4f}, {ci_hi:+.4f}]")
+        zero_note = "Contains zero (NOT significant)" if ci_lo <= 0 <= ci_hi \
+                    else "Does not contain zero (SIGNIFICANT)"
+        print(f"    {zero_note}")
+
+        u, p_mw = mannwhitney(arr_empty, arr_game)
+        print(f"\n  Mann-Whitney U test:")
+        print(f"    U = {u:.1f},  p = {fmt_p(p_mw)} {sig_stars(p_mw)}")
+
+        cd  = cohens_d(arr_empty, arr_game)
+        cld = cliffs_delta(arr_empty, arr_game)
+        print(f"\n  Effect sizes (positive = game-day > empty):")
+        print(f"    Cohen's d    : {cd:+.4f}  [{effect_label_d(cd)}]")
+        print(f"    Cliff's delta: {cld:+.4f}  [{effect_label_cliff(cld)}]")
+
+    # --- Interaction effect: (6GHz - 5GHz) gap under load vs idle ---
+    subheader("1.7  Interaction Effect: 6GHz − 5GHz Gap Under Load vs Idle")
+    print("""
+  If 6 GHz channels absorb load more efficiently than 5 GHz, the utilization
+  gap (6GHz - 5GHz) should widen under stadium load relative to empty.
+  A more negative interaction means 6 GHz stays comparatively cleaner
+  as crowd density increases — strengthening the density argument.
+""")
+    results = {}
+    for ctype, clabel in CONDITIONS:
+        a5 = lve.get(ctype, {}).get("5GHz", np.array([]))
+        a6 = lve.get(ctype, {}).get("6GHz", np.array([]))
+        if len(a5) == 0 or len(a6) == 0:
+            print(f"  No data for {clabel}.")
+            continue
+        gap = np.median(a6) - np.median(a5)
+        results[ctype] = (gap, clabel, a5, a6)
+        print(f"  {clabel:<35}  6GHz median - 5GHz median = {gap:+.4f} ({gap*100:+.2f} pp)")
+
+    if "game" in results and "empty" in results:
+        gap_game  = results["game"][0]
+        gap_empty = results["empty"][0]
+        interaction = gap_game - gap_empty
+        print(f"\n  Interaction (gap_game − gap_empty) = {interaction:+.4f} ({interaction*100:+.2f} pp)")
+        if interaction < 0:
+            print("  → The 6GHz advantage INCREASES under load: 6 GHz stays comparatively")
+            print("    cleaner than 5 GHz as stadium density rises.")
+        elif interaction > 0:
+            print("  → The 6GHz advantage DECREASES under load: 6 GHz and 5 GHz converge")
+            print("    as stadium density rises.")
+        else:
+            print("  → No change in the 6GHz vs 5GHz gap between conditions.")
+
+        # Bootstrap CI for the interaction
+        # interaction = (median(6G_game) - median(5G_game)) - (median(6G_empty) - median(5G_empty))
+        # Bootstrap by resampling within each group independently
+        rng = np.random.default_rng(42)
+        n_boot = 5000
+        boot_interactions = np.empty(n_boot)
+        a5g = results["game"][2];  a6g = results["game"][3]
+        a5e = results["empty"][2]; a6e = results["empty"][3]
+        for i in range(n_boot):
+            s5g = np.median(rng.choice(a5g, len(a5g), replace=True))
+            s6g = np.median(rng.choice(a6g, len(a6g), replace=True))
+            s5e = np.median(rng.choice(a5e, len(a5e), replace=True))
+            s6e = np.median(rng.choice(a6e, len(a6e), replace=True))
+            boot_interactions[i] = (s6g - s5g) - (s6e - s5e)
+        ci_lo = float(np.percentile(boot_interactions, 2.5))
+        ci_hi = float(np.percentile(boot_interactions, 97.5))
+        print(f"\n  Bootstrap 95% CI for interaction: [{ci_lo:+.4f}, {ci_hi:+.4f}]")
+        zero_note = "Contains zero (interaction NOT significant)" \
+                    if ci_lo <= 0 <= ci_hi else "Does not contain zero (SIGNIFICANT interaction)"
+        print(f"  {zero_note}")
 
 
 def main():

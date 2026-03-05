@@ -185,7 +185,7 @@ def run(db_path: Path) -> None:
 
     # ------------------------------------------------------------------
     subheader("7.5  Per-Game Spearman Correlation")
-    games = sorted(game_band_data.keys())
+    games = sorted(k for k in game_band_data.keys() if k is not None)
     print()
     print(f"  {'Game':<6} {'Band':<6} {'N':>6} {'rho':>8} {'p':>12} {'Sig':>5}")
     print(f"  {'-'*6} {'-'*6} {'-'*6} {'-'*8} {'-'*12} {'-'*5}")
