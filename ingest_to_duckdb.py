@@ -47,6 +47,9 @@ def parse_folder_name(folder_name: str) -> dict:
 
     iperf folders: iperf{game}_{round}
                    e.g. iperf1_2   -> campaign_type='iperf', game=1, round=2, section=None
+
+    empty folders: EMPTY_{device}
+                   e.g. EMPTY_GP6  -> campaign_type='empty', section='GP6'
     """
     game_match = re.fullmatch(r'Game(\d+)_(\d+)_(\w+)',
                               folder_name, re.IGNORECASE)
@@ -65,6 +68,15 @@ def parse_folder_name(folder_name: str) -> dict:
             'game_num': int(iperf_match.group(1)),
             'round_num': int(iperf_match.group(2)),
             'section': None,
+        }
+
+    empty_match = re.fullmatch(r'EMPTY_(\w+)', folder_name, re.IGNORECASE)
+    if empty_match:
+        return {
+            'campaign_type': 'empty',
+            'game_num': None,
+            'round_num': None,
+            'section': empty_match.group(1),
         }
 
     return {
@@ -561,7 +573,13 @@ def ingest(data_dir: Path, db_path: Path, reset: bool) -> None:
         f"Found {len(data_folders)} campaign folders, {total_files} JSON files total.\n")
 
     processed = 0
+    skipped = 0
     errors = 0
+
+    # Build a set of (folder_name, file_name) already in the database
+    already_ingested = set(
+        con.execute("SELECT folder_name, file_name FROM snapshots").fetchall()
+    )
 
     for folder in data_folders:
         folder_name = folder.name
@@ -574,6 +592,9 @@ def ingest(data_dir: Path, db_path: Path, reset: bool) -> None:
               f"files={len(json_files)}")
 
         for json_file in json_files:
+            if (folder_name, json_file.name) in already_ingested:
+                skipped += 1
+                continue
             data = load_json(json_file)
             if data is None:
                 errors += 1
@@ -633,7 +654,7 @@ def ingest(data_dir: Path, db_path: Path, reset: bool) -> None:
 
     con.close()
 
-    print(f"\nDone. {processed} files ingested, {errors} errors.")
+    print(f"\nDone. {processed} files ingested, {skipped} skipped (already in DB), {errors} errors.")
     print(f"Database written to: {db_path}")
 
 
