@@ -99,6 +99,24 @@ ORDER BY s.datetime_iso
 """
 
 
+BEACON_COUNT_QUERY = """
+SELECT
+    s.section          AS device_label,
+    s.device_name,
+    s.snapshot_id,
+    s.datetime_iso,
+    COUNT(w.id)        AS beacon_count,
+    COUNT(CASE WHEN w.band = '2.4GHz' THEN 1 END) AS cnt_2g,
+    COUNT(CASE WHEN w.band = '5GHz'   THEN 1 END) AS cnt_5g,
+    COUNT(CASE WHEN w.band = '6GHz'   THEN 1 END) AS cnt_6g
+FROM snapshots s
+LEFT JOIN wifi_beacons w USING (snapshot_id)
+WHERE s.campaign_type = 'empty'
+GROUP BY s.section, s.device_name, s.snapshot_id, s.datetime_iso
+ORDER BY s.section, s.datetime_iso
+"""
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -156,9 +174,10 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
         aliases: dict) -> None:
 
     con = duckdb.connect(str(db_path), read_only=True)
-    snap_rows = con.execute(SNAPSHOT_QUERY).fetchall()
-    wifi_rows = con.execute(WIFI_QUERY).fetchall()
-    ls_rows   = con.execute(LINK_SPEED_QUERY).fetchall()
+    snap_rows    = con.execute(SNAPSHOT_QUERY).fetchall()
+    wifi_rows    = con.execute(WIFI_QUERY).fetchall()
+    ls_rows      = con.execute(LINK_SPEED_QUERY).fetchall()
+    beacon_rows  = con.execute(BEACON_COUNT_QUERY).fetchall()
     con.close()
 
     if not snap_rows:
@@ -187,9 +206,9 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
     for m in snap_meta.values():
         devices_seen.setdefault(m["device_label"], m["device_name"])
 
-    device_labels = sorted(devices_seen.keys())
-    disp = {lbl: display_name(devices_seen[lbl], lbl, aliases)
-            for lbl in device_labels}
+        all_device_labels = sorted(devices_seen.keys())
+        disp = {lbl: display_name(devices_seen[lbl], lbl, aliases)
+            for lbl in all_device_labels}
 
     # ------------------------------------------------------------------
     # Find overlapping recording window
@@ -201,13 +220,39 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
         print("ERROR: No snapshots could be parsed — check datetime_iso format.")
         return
 
-    overlap_start = max(min(dts) for dts in dt_by_device.values())
-    overlap_end   = min(max(dts) for dts in dt_by_device.values())
+    # Device intervals and best-overlap cohort selection.
+    # This avoids impossible windows when EMPTY tests include separate sessions/days.
+    intervals = {
+        lbl: (min(dts), max(dts))
+        for lbl, dts in dt_by_device.items() if dts
+    }
+    candidate_times = sorted({
+        t for start_end in intervals.values() for t in start_end
+    })
+    best_time = max(
+        candidate_times,
+        key=lambda t: sum(1 for s, e in intervals.values() if s <= t <= e)
+    )
+    device_labels = sorted([
+        lbl for lbl, (s, e) in intervals.items()
+        if s <= best_time <= e
+    ])
+
+    if len(device_labels) < 2:
+        print("Not enough overlapping devices in EMPTY tests for comparison.")
+        return
+
+    overlap_start = max(intervals[lbl][0] for lbl in device_labels)
+    overlap_end   = min(intervals[lbl][1] for lbl in device_labels)
+
+    if overlap_end < overlap_start:
+        print("No valid overlapping window found across selected EMPTY-test devices.")
+        return
 
     # Filter snaps to overlap window
     snap_in_window = {
         sid: m for sid, m in snap_meta.items()
-        if overlap_start <= m["dt"] <= overlap_end
+        if m["device_label"] in device_labels and overlap_start <= m["dt"] <= overlap_end
     }
 
     # ------------------------------------------------------------------
@@ -260,13 +305,19 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
 
     # 0.0  Recording window
     subheader("0.0  EMPTY Test Recording Window")
-    print(f"\n  Devices found       : {len(device_labels)}")
-    for lbl in device_labels:
+    print(f"\n  Devices found       : {len(all_device_labels)}")
+    print(f"  Devices compared    : {len(device_labels)}")
+    excluded = [lbl for lbl in all_device_labels if lbl not in device_labels]
+    for lbl in all_device_labels:
         dts = dt_by_device[lbl]
         print(f"    {disp[lbl]:<40}  "
               f"{min(dts).strftime('%Y-%m-%d %H:%M:%S')} UTC  →  "
               f"{max(dts).strftime('%Y-%m-%d %H:%M:%S')} UTC  "
               f"({len(dts)} snapshots)")
+    if excluded:
+        print("\n  Excluded from this comparison (no overlap with main cohort):")
+        for lbl in excluded:
+            print(f"    {disp[lbl]}")
 
     dur_min = (overlap_end - overlap_start).total_seconds() / 60
     print(f"\n  Overlapping window  : {overlap_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
@@ -376,31 +427,35 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
 
     pairs = list(combinations(valid_labels, 2))
     n_pairs = len(pairs)
-    print(f"\n  {n_pairs} pairs, Bonferroni α = {0.05/n_pairs:.4f}\n")
+    if n_pairs == 0:
+        print("\n  Not enough device pairs with data for pairwise comparisons.")
+    else:
+        print(f"\n  {n_pairs} pairs, Bonferroni α = {0.05/n_pairs:.4f}\n")
 
     pair_headers = ["Device A", "Device B", "Δ median (B−A)",
                     "95% CI", "U", "p (raw)", "p (adj)", "sig", "Cliff's δ", "effect"]
     pair_rows = []
-    for la, lb in pairs:
-        aa = bias_arrays[la]
-        ab = bias_arrays[lb]
-        obs, ci_lo, ci_hi = bootstrap_median_ci(aa, ab)
-        U, p_raw = mannwhitney(aa, ab)
-        p_adj = min(p_raw * n_pairs, 1.0)
-        cd = cliffs_delta(aa, ab)
-        pair_rows.append([
-            disp[la],
-            disp[lb],
-            f"{obs:+.2f} dB",
-            f"[{ci_lo:+.2f}, {ci_hi:+.2f}]",
-            f"{U:.0f}",
-            fmt_p(p_raw),
-            fmt_p(p_adj),
-            sig_stars(p_adj),
-            f"{cd:+.3f}",
-            effect_label_cliff(cd),
-        ])
-    print_table(pair_headers, pair_rows)
+    if n_pairs > 0:
+        for la, lb in pairs:
+            aa = bias_arrays[la]
+            ab = bias_arrays[lb]
+            obs, ci_lo, ci_hi = bootstrap_median_ci(aa, ab)
+            U, p_raw = mannwhitney(aa, ab)
+            p_adj = min(p_raw * n_pairs, 1.0)
+            cd = cliffs_delta(aa, ab)
+            pair_rows.append([
+                disp[la],
+                disp[lb],
+                f"{obs:+.2f} dB",
+                f"[{ci_lo:+.2f}, {ci_hi:+.2f}]",
+                f"{U:.0f}",
+                fmt_p(p_raw),
+                fmt_p(p_adj),
+                sig_stars(p_adj),
+                f"{cd:+.3f}",
+                effect_label_cliff(cd),
+            ])
+        print_table(pair_headers, pair_rows)
 
     # ------------------------------------------------------------------
     # 0.5  Summary / interpretation
@@ -429,6 +484,145 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
         print(f"\n  Devices ranked low→high by median bias (dB vs group median):")
         for lbl, med in ranked:
             print(f"    {disp[lbl]:<40}  {med:+.2f} dB")
+
+    # ------------------------------------------------------------------
+    # 0.5b  All feasible pairwise comparisons (across separate EMPTY sessions)
+    subheader("0.5b  All Feasible Pairwise Device Comparisons (uses each pair's own overlap)")
+    print("""
+  This table compares every device pair that has any overlapping time window,
+  even if they are not in the same global cohort. Pairs with no overlap are
+  listed as NO OVERLAP.
+""")
+
+    pair_overlap_results = []
+    base_names = {lbl: disp[lbl] for lbl in all_device_labels}
+    base_counts = defaultdict(int)
+    for name in base_names.values():
+        base_counts[name] += 1
+    pair_disp = {
+        lbl: (f"{base_names[lbl]} [{lbl}]" if base_counts[base_names[lbl]] > 1 else base_names[lbl])
+        for lbl in all_device_labels
+    }
+
+    all_pairs = list(combinations(all_device_labels, 2))
+    for la, lb in all_pairs:
+        start = max(intervals[la][0], intervals[lb][0])
+        end = min(intervals[la][1], intervals[lb][1])
+        overlap_min = (end - start).total_seconds() / 60
+
+        if end < start:
+            pair_overlap_results.append({
+                "a": la,
+                "b": lb,
+                "overlap_min": 0.0,
+                "matched_bins": 0,
+                "delta": None,
+                "p_raw": None,
+                "cliff": None,
+                "note": "NO OVERLAP",
+            })
+            continue
+
+        # Snapshots for the pair within its own overlap window
+        pair_snap = {
+            sid: m for sid, m in snap_meta.items()
+            if m["device_label"] in (la, lb) and start <= m["dt"] <= end
+        }
+        pair_snap_ids = set(pair_snap.keys())
+        if not pair_snap_ids:
+            pair_overlap_results.append({
+                "a": la,
+                "b": lb,
+                "overlap_min": overlap_min,
+                "matched_bins": 0,
+                "delta": None,
+                "p_raw": None,
+                "cliff": None,
+                "note": "No snapshots in overlap",
+            })
+            continue
+
+        pair_matched = defaultdict(lambda: defaultdict(list))
+        for sid, bssid, rssi, band in wifi_rows:
+            if sid not in pair_snap_ids:
+                continue
+            if band_filter and band != band_filter:
+                continue
+            dlabel = pair_snap[sid]["device_label"]
+            tbin = ts_bin(pair_snap[sid]["dt"], bin_sec)
+            pair_matched[(bssid, tbin)][dlabel].append(rssi)
+
+        # Keep only bins where BOTH devices are present
+        both_present = {
+            k: v for k, v in pair_matched.items()
+            if la in v and lb in v
+        }
+
+        if not both_present:
+            pair_overlap_results.append({
+                "a": la,
+                "b": lb,
+                "overlap_min": overlap_min,
+                "matched_bins": 0,
+                "delta": None,
+                "p_raw": None,
+                "cliff": None,
+                "note": "Overlap but no matched BSSID/bin",
+            })
+            continue
+
+        a_vals = []
+        b_vals = []
+        for _, dev_map in both_present.items():
+            a_vals.append(float(np.median(dev_map[la])))
+            b_vals.append(float(np.median(dev_map[lb])))
+
+        arr_a = np.array(a_vals)
+        arr_b = np.array(b_vals)
+        delta = float(np.median(arr_b) - np.median(arr_a))
+        _, p_raw = mannwhitney(arr_a, arr_b)
+        cliff = cliffs_delta(arr_a, arr_b)
+        pair_overlap_results.append({
+            "a": la,
+            "b": lb,
+            "overlap_min": overlap_min,
+            "matched_bins": len(both_present),
+            "delta": delta,
+            "p_raw": p_raw,
+            "cliff": cliff,
+            "note": "OK",
+        })
+
+    valid_p = [r for r in pair_overlap_results if r["p_raw"] is not None]
+    n_valid_p = len(valid_p)
+    for r in pair_overlap_results:
+        if r["p_raw"] is None or n_valid_p == 0:
+            r["p_adj"] = None
+            r["sig"] = "-"
+        else:
+            p_adj = min(r["p_raw"] * n_valid_p, 1.0)
+            r["p_adj"] = p_adj
+            r["sig"] = sig_stars(p_adj)
+
+    pair_tbl_headers = [
+        "Device A", "Device B", "Overlap (min)", "Matched bins",
+        "Δ median (B−A)", "p (adj)", "Cliff's δ", "Sig", "Note"
+    ]
+    pair_tbl_rows = []
+    for r in pair_overlap_results:
+        pair_tbl_rows.append([
+            pair_disp[r["a"]],
+            pair_disp[r["b"]],
+            f"{r['overlap_min']:.1f}",
+            r["matched_bins"],
+            f"{r['delta']:+.2f} dB" if r["delta"] is not None else "N/A",
+            fmt_p(r["p_adj"]) if r["p_adj"] is not None else "N/A",
+            f"{r['cliff']:+.3f}" if r["cliff"] is not None else "N/A",
+            r["sig"],
+            r["note"],
+        ])
+    print()
+    print_table(pair_tbl_headers, pair_tbl_rows)
 
     # ------------------------------------------------------------------
     # 0.6  Link speed comparison (connected AP only)
@@ -551,6 +745,129 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
                     ])
                 print()
                 print_table(pw_hdr, pw_rows)
+
+
+    # ------------------------------------------------------------------
+    # 0.7  Beacon count analysis
+    header("SECTION 0.7 — BEACON COUNT VARIABILITY (EMPTY TESTS)")
+    print("""
+  Measures how many distinct Wi-Fi beacons each device detected per scan
+  snapshot, broken down by band.  A higher count means the device's Wi-Fi
+  radio is more sensitive / broader in its scanning behaviour.
+""")
+
+    if not beacon_rows:
+        print("  No beacon data found for empty campaign.")
+    else:
+        # Organise per-device lists of (total, 2g, 5g, 6g) counts per snapshot
+        bc_by_device: dict[str, dict] = defaultdict(lambda: {
+            "dname": "", "total": [], "cnt_2g": [], "cnt_5g": [], "cnt_6g": []
+        })
+        for dlabel, dname, sid, dt_iso, total, c2, c5, c6 in beacon_rows:
+            d = bc_by_device[dlabel]
+            d["dname"] = dname
+            d["total"].append(total)
+            d["cnt_2g"].append(c2)
+            d["cnt_5g"].append(c5)
+            d["cnt_6g"].append(c6)
+
+        bc_labels = sorted(bc_by_device.keys())
+        bc_disp = {
+            lbl: display_name(bc_by_device[lbl]["dname"], lbl, aliases)
+            for lbl in bc_labels
+        }
+
+        # 0.7a  Per-device descriptive stats on total beacons/snapshot
+        subheader("0.7a  Beacons per Snapshot — Descriptive Statistics")
+        hdr = ["Device", "Snaps", "Total", "Median/snap", "Mean/snap",
+               "Std", "Min", "Max", "CV"]
+        tbl = []
+        bc_arrays: dict[str, np.ndarray] = {}
+        for lbl in bc_labels:
+            arr = np.array(bc_by_device[lbl]["total"], dtype=float)
+            bc_arrays[lbl] = arr
+            d = descriptive(arr)
+            tbl.append([
+                bc_disp[lbl],
+                len(arr),
+                int(arr.sum()),
+                fmt(d["median"], 1),
+                fmt(d["mean"], 1),
+                fmt(d["std"], 2),
+                int(d["min"]),
+                int(d["max"]),
+                fmt(d["cv"], 3),
+            ])
+        print()
+        print_table(hdr, tbl)
+
+        # 0.7b  Band breakdown
+        subheader("0.7b  Band Breakdown (total beacons across all snapshots)")
+        band_hdr = ["Device", "Total", "2.4GHz", "2.4 %", "5GHz", "5 %", "6GHz", "6 %"]
+        band_tbl = []
+        for lbl in bc_labels:
+            d   = bc_by_device[lbl]
+            tot = int(sum(d["total"]))
+            g2  = int(sum(d["cnt_2g"]))
+            g5  = int(sum(d["cnt_5g"]))
+            g6  = int(sum(d["cnt_6g"]))
+            pct = lambda n: f"{100*n/tot:.1f}%" if tot else "N/A"
+            band_tbl.append([bc_disp[lbl], tot,
+                             g2, pct(g2),
+                             g5, pct(g5),
+                             g6, pct(g6)])
+        print()
+        print_table(band_hdr, band_tbl)
+
+        # 0.7c  Kruskal-Wallis + pairwise on total beacons/snapshot
+        subheader("0.7c  Statistical Comparison of Beacons/Snapshot Across Devices")
+        valid_bc = [lbl for lbl in bc_labels if len(bc_arrays.get(lbl, [])) > 1]
+        if len(valid_bc) >= 2:
+            H_bc, p_kw_bc = kruskal_wallis(*[bc_arrays[lbl] for lbl in valid_bc])
+            print(f"\n  Kruskal-Wallis: H = {H_bc:.4f},  p = {fmt_p(p_kw_bc)} {sig_stars(p_kw_bc)}")
+            if p_kw_bc < 0.05:
+                print("  → Significant differences in beacon detection across devices.")
+            else:
+                print("  → No significant difference detected.")
+
+            bc_pairs    = list(combinations(valid_bc, 2))
+            n_bc_pairs  = len(bc_pairs)
+            print(f"\n  Pairwise comparisons (Bonferroni α = {0.05/n_bc_pairs:.4f}):\n")
+            pw_hdr = ["Device A", "Device B", "Δ median",
+                      "95% CI", "p (raw)", "p (adj)", "sig", "Cliff's δ", "effect"]
+            pw_rows = []
+            for la, lb in bc_pairs:
+                obs, ci_lo, ci_hi = bootstrap_median_ci(bc_arrays[la], bc_arrays[lb])
+                _, p_raw = mannwhitney(bc_arrays[la], bc_arrays[lb])
+                p_adj   = min(p_raw * n_bc_pairs, 1.0)
+                cd      = cliffs_delta(bc_arrays[la], bc_arrays[lb])
+                pw_rows.append([
+                    bc_disp[la], bc_disp[lb],
+                    f"{obs:+.1f}",
+                    f"[{ci_lo:+.1f}, {ci_hi:+.1f}]",
+                    fmt_p(p_raw), fmt_p(p_adj),
+                    sig_stars(p_adj),
+                    f"{cd:+.3f}",
+                    effect_label_cliff(cd),
+                ])
+            print_table(pw_hdr, pw_rows)
+
+        # 0.7d  Ranking
+        subheader("0.7d  Device Ranking by Median Beacons/Snapshot")
+        print()
+        ranked_bc = sorted(
+            [(lbl, float(np.median(bc_arrays[lbl]))) for lbl in valid_bc],
+            key=lambda x: x[1], reverse=True
+        )
+        rank_hdr = ["Rank", "Device", "Median beacons/snap", "6 GHz beacons", "6 GHz %"]
+        rank_tbl = []
+        for rank, (lbl, med) in enumerate(ranked_bc, 1):
+            d   = bc_by_device[lbl]
+            tot = int(sum(d["total"]))
+            g6  = int(sum(d["cnt_6g"]))
+            pct6 = f"{100*g6/tot:.1f}%" if tot else "N/A"
+            rank_tbl.append([rank, bc_disp[lbl], f"{med:.1f}", g6, pct6])
+        print_table(rank_hdr, rank_tbl)
 
 
 def main():

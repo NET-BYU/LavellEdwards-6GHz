@@ -7,6 +7,7 @@
 # 1. Find all *.zip files in the zips/ folder (optionally filtered by KEYWORD)
 # 2. Create a folder under data/ for each zip (named after the zip file)
 # 3. Extract the contents into that folder
+# 4. Run format_json_files.py only on the newly extracted folders
 
 # Color codes for output
 RED='\033[0;31m'
@@ -17,6 +18,13 @@ NC='\033[0m' # No Color
 KEYWORD="${1:-}"
 ZIPS_DIR="./zips"
 DATA_DIR="./data"
+
+# Use the venv python if available, otherwise fall back to python3
+if [ -f ".venv/bin/python" ]; then
+    PYTHON=".venv/bin/python"
+else
+    PYTHON="python3"
+fi
 
 if [ ! -d "$ZIPS_DIR" ]; then
     echo -e "${RED}ERROR: zips/ folder not found.${NC}"
@@ -52,6 +60,9 @@ echo "Found ${#zip_files[@]} zip file(s) to process..."
 # Ensure data/ folder exists
 mkdir -p "$DATA_DIR"
 
+# Track which folder names were newly extracted this run
+newly_extracted=()
+
 # Process each zip file
 for zip_file in "${zip_files[@]}"; do
     base="$(basename "$zip_file")"
@@ -72,6 +83,7 @@ for zip_file in "${zip_files[@]}"; do
     # Extract the zip file
     if unzip -q -o "$zip_file" -d "$destination_path"; then
         echo -e "  ${GREEN}Extracted successfully to: data/$folder_name${NC}"
+        newly_extracted+=("$folder_name")
     else
         echo -e "  ${RED}ERROR: Failed to extract $base${NC}"
     fi
@@ -80,11 +92,21 @@ done
 echo ""
 echo "All done!"
 
-# Format extracted .txt files to .json
+# Format extracted .txt files to .json — only for newly extracted folders
+if [ ${#newly_extracted[@]} -eq 0 ]; then
+    echo "No new folders extracted; skipping formatter."
+    exit 0
+fi
+
 echo ""
 echo "Formatting extracted files to JSON..."
 if [ -f "./format_json_files.py" ]; then
-    if python3 format_json_files.py; then
+    if [ -n "$KEYWORD" ]; then
+        FORMAT_ARGS="--name $KEYWORD"
+    else
+        FORMAT_ARGS=""
+    fi
+    if $PYTHON format_json_files.py $FORMAT_ARGS; then
         echo -e "${GREEN}JSON formatting complete!${NC}"
     else
         echo -e "${YELLOW}WARNING: Could not run format_json_files.py${NC}"
