@@ -297,6 +297,121 @@ def run(db_path: Path) -> None:
     print_table(beacon_hdr, beacon_tbl)
 
     # ------------------------------------------------------------------
+    # 3.3b  Cumulative weak-signal statistics (attenuation proxy)
+    subheader("3.3b  Cumulative Weak-Signal Statistics (proxy for far-away radios)")
+    print("""
+  Uses cumulative RSSI tails to estimate distant-beacon bleed-through.
+  More very-weak beacons (e.g., <= -85 dBm) typically indicate more
+  far-away APs being visible. Lower tails under game load support stronger
+  attenuation / spatial isolation.
+""")
+
+    def all_rssi_for(dev: str, cond: str) -> np.ndarray:
+        vals = []
+        for band_map in metrics_band.get(dev, {}).get(cond, {}).values():
+            vals.extend(band_map.get("rssi", []))
+        return np.array(vals, dtype=float)
+
+    tail_hdr = [
+        "Device", "N empty", "N game",
+        "%<=-85 empty", "%<=-85 game", "Δ pp",
+        "%<=-80 empty", "%<=-80 game", "Δ pp",
+        "Median empty", "Median game", "Δ median"
+    ]
+    tail_tbl = []
+
+    # pooled row first
+    pooled_empty = np.concatenate([all_rssi_for(dev, "empty") for dev in devices])
+    pooled_game = np.concatenate([all_rssi_for(dev, "game") for dev in devices])
+
+    def tail_row(label: str, arr_empty: np.ndarray, arr_game: np.ndarray):
+        if len(arr_empty) < 3 or len(arr_game) < 3:
+            return [label, len(arr_empty), len(arr_game)] + ["N/A"] * 9
+        e85 = np.mean(arr_empty <= -85) * 100
+        g85 = np.mean(arr_game <= -85) * 100
+        e80 = np.mean(arr_empty <= -80) * 100
+        g80 = np.mean(arr_game <= -80) * 100
+        me = float(np.median(arr_empty))
+        mg = float(np.median(arr_game))
+        return [
+            label,
+            len(arr_empty), len(arr_game),
+            f"{e85:.1f}%", f"{g85:.1f}%", f"{g85-e85:+.1f}",
+            f"{e80:.1f}%", f"{g80:.1f}%", f"{g80-e80:+.1f}",
+            f"{me:.2f}", f"{mg:.2f}", f"{mg-me:+.2f}",
+        ]
+
+    tail_tbl.append(tail_row("ALL DEVICES", pooled_empty, pooled_game))
+
+    for dev in devices:
+        arr_empty = all_rssi_for(dev, "empty")
+        arr_game = all_rssi_for(dev, "game")
+        tail_tbl.append(tail_row(device_label_pretty(dev, device_meta), arr_empty, arr_game))
+
+    print()
+    print_table(tail_hdr, tail_tbl)
+
+    # ------------------------------------------------------------------
+    # 3.3c  Cumulative beacon-count summary (audible beacons)
+    subheader("3.3c  Cumulative Audible Beacon Count Summary (empty vs full)")
+    print("""
+  Beacon counts are per snapshot and represent how many AP beacons the phone
+  could hear at that moment. Higher values imply more radios being audible.
+""")
+
+    def beacon_row(label: str, arr_empty: np.ndarray, arr_game: np.ndarray):
+        if len(arr_empty) == 0 or len(arr_game) == 0:
+            return [label, len(arr_empty), len(arr_game)] + ["N/A"] * 7
+
+        mean_e = float(np.mean(arr_empty))
+        mean_g = float(np.mean(arr_game))
+        med_e = float(np.median(arr_empty))
+        med_g = float(np.median(arr_game))
+        pct_mean = ((mean_g - mean_e) / mean_e * 100) if mean_e != 0 else float("nan")
+        pct_med = ((med_g - med_e) / med_e * 100) if med_e != 0 else float("nan")
+
+        return [
+            label,
+            len(arr_empty),
+            len(arr_game),
+            f"{mean_e:.1f}",
+            f"{mean_g:.1f}",
+            f"{mean_g-mean_e:+.1f}",
+            f"{pct_mean:+.1f}%",
+            f"{med_e:.1f}",
+            f"{med_g:.1f}",
+            f"{med_g-med_e:+.1f}",
+            f"{pct_med:+.1f}%",
+        ]
+
+    pooled_beacon_empty = np.concatenate([
+        np.array(beacon_store.get(dev, {}).get("empty", []), dtype=float)
+        for dev in devices
+    ])
+    pooled_beacon_game = np.concatenate([
+        np.array(beacon_store.get(dev, {}).get("game", []), dtype=float)
+        for dev in devices
+    ])
+
+    beacon_sum_hdr = [
+        "Device",
+        "N empty", "N game",
+        "Mean empty", "Mean game", "Δ mean", "%Δ mean",
+        "Median empty", "Median game", "Δ median", "%Δ median",
+    ]
+    beacon_sum_tbl = [
+        beacon_row("ALL DEVICES", pooled_beacon_empty, pooled_beacon_game)
+    ]
+
+    for dev in devices:
+        arr_empty = np.array(beacon_store.get(dev, {}).get("empty", []), dtype=float)
+        arr_game = np.array(beacon_store.get(dev, {}).get("game", []), dtype=float)
+        beacon_sum_tbl.append(beacon_row(device_label_pretty(dev, device_meta), arr_empty, arr_game))
+
+    print()
+    print_table(beacon_sum_hdr, beacon_sum_tbl)
+
+    # ------------------------------------------------------------------
     subheader("3.4  Connected Link Speed Metrics (game - empty)")
     for metric_key, metric_label in [
         ("link", "Link Speed"),

@@ -9,6 +9,10 @@
      - Kruskal-Wallis across sections per band
      - Post-hoc pairwise Mann-Whitney with Bonferroni correction
 
+6.3  Cumulative RSSI: Empty vs Full Stadium
+    - Overall and per-band mean/median/dispersion differences
+    - Mann-Whitney + bootstrap CI
+
 Output: outputs/6_rssi.txt
 """
 
@@ -48,11 +52,21 @@ WHERE w.rssi IS NOT NULL
   AND w.band IN ('5GHz', '6GHz')
 """
 
+QUERY_EMPTY_VS_GAME = """
+SELECT s.campaign_type, w.band, w.rssi
+FROM wifi_beacons w
+JOIN snapshots s USING (snapshot_id)
+WHERE w.rssi IS NOT NULL
+    AND s.campaign_type IN ('empty', 'game')
+    AND w.band IN ('2.4GHz', '5GHz', '6GHz')
+"""
+
 
 def run(db_path: Path) -> None:
     con = duckdb.connect(str(db_path), read_only=True)
     band_rows    = con.execute(QUERY_BAND).fetchall()
     section_rows = con.execute(QUERY_SECTION).fetchall()
+    eg_rows      = con.execute(QUERY_EMPTY_VS_GAME).fetchall()
     con.close()
 
     # Band data
@@ -71,6 +85,16 @@ def run(db_path: Path) -> None:
         sec_data.setdefault(band, {}).setdefault(section, []).append(rssi)
     sec_arr = {b: {sec: np.array(v) for sec, v in sd.items()}
                for b, sd in sec_data.items()}
+
+    # Empty vs game data
+    eg_data: dict = {}
+    for campaign, band, rssi in eg_rows:
+        eg_data.setdefault(campaign, {}).setdefault(band, []).append(rssi)
+        eg_data.setdefault(campaign, {}).setdefault("ALL", []).append(rssi)
+    eg_arr = {
+        c: {b: np.array(v) for b, v in bd.items()}
+        for c, bd in eg_data.items()
+    }
 
     header("SECTION 6 — RSSI DISTRIBUTIONS")
 
@@ -187,6 +211,60 @@ def run(db_path: Path) -> None:
                 sig = "***" if p_p < alpha_bonf else ("*" if p_p < 0.05 else "ns")
                 label = f"{s1} vs {s2}"
                 print(f"    {label:<18} {u_p:>10.1f} {fmt_p(p_p):>12} {sig:>5} {cld:>+8.4f}")
+
+    # ------------------------------------------------------------------
+    subheader("6.3  Cumulative RSSI Comparison: Empty vs Full Stadium")
+    print("""
+  Compares aggregate RSSI distributions between empty-stadium baseline and
+  full-stadium game conditions. Positive deltas indicate stronger (less
+  negative) RSSI during games.
+""")
+
+    comp_hdr = [
+        "Group", "N empty", "N game",
+        "Mean empty", "Mean game", "Δ mean",
+        "Median empty", "Median game", "Δ median",
+        "Std empty", "Std game", "IQR empty", "IQR game",
+        "p", "Sig"
+    ]
+    comp_rows = []
+
+    for grp in ("ALL", "2.4GHz", "5GHz", "6GHz"):
+        arr_e = eg_arr.get("empty", {}).get(grp, np.array([]))
+        arr_g = eg_arr.get("game", {}).get(grp, np.array([]))
+
+        if len(arr_e) < 3 or len(arr_g) < 3:
+            comp_rows.append([grp, len(arr_e), len(arr_g)] + ["N/A"] * 12)
+            continue
+
+        d_e = descriptive(arr_e)
+        d_g = descriptive(arr_g)
+        _, p = mannwhitney(arr_e, arr_g)
+
+        comp_rows.append([
+            grp,
+            f"{d_e['n']:,}", f"{d_g['n']:,}",
+            f"{d_e['mean']:.2f}", f"{d_g['mean']:.2f}", f"{(d_g['mean']-d_e['mean']):+.2f}",
+            f"{d_e['median']:.2f}", f"{d_g['median']:.2f}", f"{(d_g['median']-d_e['median']):+.2f}",
+            f"{d_e['std']:.2f}", f"{d_g['std']:.2f}",
+            f"{d_e['iqr']:.2f}", f"{d_g['iqr']:.2f}",
+            fmt_p(p), sig_stars(p),
+        ])
+
+    print()
+    print_table(comp_hdr, comp_rows)
+
+    print("\n  Median difference bootstrap CIs (game - empty):")
+    print(f"  {'Group':<8} {'Δ median':>10} {'95% CI':>24}")
+    print(f"  {'-'*8} {'-'*10} {'-'*24}")
+    for grp in ("ALL", "2.4GHz", "5GHz", "6GHz"):
+        arr_e = eg_arr.get("empty", {}).get(grp, np.array([]))
+        arr_g = eg_arr.get("game", {}).get(grp, np.array([]))
+        if len(arr_e) < 3 or len(arr_g) < 3:
+            print(f"  {grp:<8} {'N/A':>10} {'N/A':>24}")
+            continue
+        obs, ci_lo, ci_hi = bootstrap_median_ci(arr_e, arr_g)
+        print(f"  {grp:<8} {obs:>+10.2f} [{ci_lo:+.2f}, {ci_hi:+.2f}] dBm")
 
 
 def main():

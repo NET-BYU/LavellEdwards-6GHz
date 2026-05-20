@@ -2,10 +2,11 @@
 4_tx_power.py  --  Section 4: Reported AP TX Power by Band and Space
 
 Analyzes reported AP transmit power (`tx_power`) from SigCap data:
-  4.1 Overall TX power by band (5GHz vs 6GHz)
-  4.2 TX power by space/section (game campaigns)
-  4.3 TX power by space × band (game campaigns)
-  4.4 Spatial variability tests per band
+    4.1 Overall TX power by band (5GHz vs 6GHz)
+    4.1b Game vs empty TX power comparison
+    4.2 TX power by space/section (game campaigns)
+    4.3 TX power by space × band (game campaigns)
+    4.4 Spatial variability tests per band
 
 Output: outputs/4_tx_power.txt
 """
@@ -38,6 +39,7 @@ FROM wifi_beacons w
 JOIN snapshots s USING (snapshot_id)
 WHERE w.tx_power > 0
   AND w.tx_power < 2147483647
+    AND w.width = 20
   AND w.band IN ('5GHz', '6GHz')
 """
 
@@ -54,12 +56,22 @@ def run(db_path: Path) -> None:
     # ------------------------------------------------------------------
     # Organize data
     by_band = {"5GHz": [], "6GHz": []}
+    by_campaign = {"game": [], "empty": []}
+    by_campaign_band = {
+        "game": {"5GHz": [], "6GHz": []},
+        "empty": {"5GHz": [], "6GHz": []},
+    }
     by_space = {}          # section -> [tx_power]
     by_space_band = {}     # section -> {band -> [tx_power]}
 
     for campaign, game_num, section, band, txp in rows:
         if band in by_band:
             by_band[band].append(txp)
+
+        if campaign in by_campaign:
+            by_campaign[campaign].append(txp)
+            if band in by_campaign_band[campaign]:
+                by_campaign_band[campaign][band].append(txp)
 
         # Space analysis is game-only to represent stadium sections
         if campaign != "game" or section is None:
@@ -74,7 +86,7 @@ def run(db_path: Path) -> None:
 
     header("SECTION 4 — REPORTED AP TX POWER BY BAND AND SPACE")
     print("  Metric: wifi_beacons.tx_power (dBm, reported by scan records)")
-    print("  Valid rows filter: tx_power > 0 and tx_power < 2147483647")
+    print("  Valid rows filter: tx_power > 0 and tx_power < 2147483647 and width = 20 MHz")
     print("  Spatial analysis scope: campaign_type='game' sections")
 
     # ------------------------------------------------------------------
@@ -111,6 +123,50 @@ def run(db_path: Path) -> None:
     print(f"  Mann-Whitney U: {u:.1f}, p={fmt_p(p)} {sig_stars(p)}")
     print(f"  Cohen's d: {cd:+.4f} [{effect_label_d(cd)}]")
     print(f"  Cliff's delta: {cld:+.4f} [{effect_label_cliff(cld)}]")
+
+    # ------------------------------------------------------------------
+    subheader("4.1b  Game vs Empty TX Power Comparison")
+
+    cmp_rows = []
+    cmp_specs = [
+        ("All bands", np.array(by_campaign["game"], dtype=float), np.array(by_campaign["empty"], dtype=float)),
+        ("5GHz", np.array(by_campaign_band["game"]["5GHz"], dtype=float), np.array(by_campaign_band["empty"]["5GHz"], dtype=float)),
+        ("6GHz", np.array(by_campaign_band["game"]["6GHz"], dtype=float), np.array(by_campaign_band["empty"]["6GHz"], dtype=float)),
+    ]
+
+    for label, arr_game, arr_empty in cmp_specs:
+        if len(arr_game) == 0 or len(arr_empty) == 0:
+            cmp_rows.append([label, len(arr_game), len(arr_empty), "N/A", "N/A", "N/A", "N/A", "N/A", "N/A"])
+            continue
+        d_game = descriptive(arr_game)
+        d_empty = descriptive(arr_empty)
+        obs, ci_lo, ci_hi = bootstrap_median_ci(arr_empty, arr_game)
+        u_ge, p_ge = mannwhitney(arr_empty, arr_game)
+        cld_ge = cliffs_delta(arr_empty, arr_game)
+        cmp_rows.append([
+            label,
+            f"{d_game['n']:,}",
+            f"{d_empty['n']:,}",
+            fmt(d_game['median'], 2),
+            fmt(d_empty['median'], 2),
+            f"{obs:+.2f}",
+            f"[{ci_lo:+.2f}, {ci_hi:+.2f}]",
+            fmt_p(p_ge),
+            sig_stars(p_ge),
+        ])
+
+    print()
+    print_table(
+        ["Group", "Game N", "Empty N", "Game med", "Empty med", "Δ median (G-E)", "95% CI", "p", "Sig"],
+        cmp_rows,
+    )
+
+    print("\n  Effect size note: positive Δ median means reported TX power is higher during games.")
+    for label, arr_game, arr_empty in cmp_specs:
+        if len(arr_game) == 0 or len(arr_empty) == 0:
+            continue
+        cld_ge = cliffs_delta(arr_empty, arr_game)
+        print(f"  {label:<8} Cliff's δ (game vs empty): {cld_ge:+.4f} [{effect_label_cliff(cld_ge)}]")
 
     # ------------------------------------------------------------------
     subheader("4.2  TX Power by Space (game sections, all bands combined)")

@@ -220,8 +220,9 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
         print("ERROR: No snapshots could be parsed — check datetime_iso format.")
         return
 
-    # Device intervals and best-overlap cohort selection.
-    # This avoids impossible windows when EMPTY tests include separate sessions/days.
+    # Device intervals and overlap cohort selection.
+    # EMPTY tests can include separate sessions/days, so we analyze all maximal
+    # overlap cohorts (not just one "best" cohort).
     intervals = {
         lbl: (min(dts), max(dts))
         for lbl, dts in dt_by_device.items() if dts
@@ -229,261 +230,278 @@ def run(db_path: Path, bin_sec: int, band_filter: str | None,
     candidate_times = sorted({
         t for start_end in intervals.values() for t in start_end
     })
-    best_time = max(
-        candidate_times,
-        key=lambda t: sum(1 for s, e in intervals.values() if s <= t <= e)
-    )
-    device_labels = sorted([
-        lbl for lbl, (s, e) in intervals.items()
-        if s <= best_time <= e
-    ])
+    raw_cohorts = []
+    for t in candidate_times:
+        cohort = frozenset(
+            lbl for lbl, (s, e) in intervals.items()
+            if s <= t <= e
+        )
+        if len(cohort) >= 2:
+            raw_cohorts.append(cohort)
 
-    if len(device_labels) < 2:
+    unique_cohorts = []
+    seen = set()
+    for cohort in raw_cohorts:
+        if cohort not in seen:
+            unique_cohorts.append(cohort)
+            seen.add(cohort)
+
+    # Keep only maximal cohorts (drop strict subsets)
+    maximal_cohorts = [
+        c for c in unique_cohorts
+        if not any(c < other for other in unique_cohorts)
+    ]
+
+    if not maximal_cohorts:
         print("Not enough overlapping devices in EMPTY tests for comparison.")
         return
 
-    overlap_start = max(intervals[lbl][0] for lbl in device_labels)
-    overlap_end   = min(intervals[lbl][1] for lbl in device_labels)
+    cohort_specs = []
+    for cohort in maximal_cohorts:
+        labels = sorted(cohort)
+        overlap_start = max(intervals[lbl][0] for lbl in labels)
+        overlap_end = min(intervals[lbl][1] for lbl in labels)
+        if overlap_end < overlap_start:
+            continue
+        cohort_specs.append((labels, overlap_start, overlap_end))
 
-    if overlap_end < overlap_start:
+    if not cohort_specs:
         print("No valid overlapping window found across selected EMPTY-test devices.")
         return
 
-    # Filter snaps to overlap window
-    snap_in_window = {
-        sid: m for sid, m in snap_meta.items()
-        if m["device_label"] in device_labels and overlap_start <= m["dt"] <= overlap_end
-    }
+    cohort_specs.sort(key=lambda x: (x[1], x[2]))
 
-    # ------------------------------------------------------------------
-    # Build WiFi index: snap_id -> [(bssid, rssi, band)]
-    wifi_by_snap = defaultdict(list)
-    for sid, bssid, rssi, band in wifi_rows:
-        if sid in snap_in_window:
-            if band_filter and band != band_filter:
+    def run_cohort(device_labels: list[str], overlap_start, overlap_end,
+                   cohort_index: int, cohort_total: int) -> None:
+        # Filter snaps to overlap window
+        snap_in_window = {
+            sid: m for sid, m in snap_meta.items()
+            if m["device_label"] in device_labels and overlap_start <= m["dt"] <= overlap_end
+        }
+
+        # Build WiFi index: snap_id -> [(bssid, rssi, band)]
+        wifi_by_snap = defaultdict(list)
+        for sid, bssid, rssi, band in wifi_rows:
+            if sid in snap_in_window:
+                if band_filter and band != band_filter:
+                    continue
+                wifi_by_snap[sid].append((bssid, rssi, band))
+
+        # Build matched scans:
+        # key: (bssid, time_bin) -> {device_label: [rssi, ...]}
+        matched: dict[tuple, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        for sid, m in snap_in_window.items():
+            tbin = ts_bin(m["dt"], bin_sec)
+            dlabel = m["device_label"]
+            for bssid, rssi, band in wifi_by_snap.get(sid, []):
+                matched[(bssid, tbin)][dlabel].append(rssi)
+
+        # Keep only bins where 2+ devices are present
+        shared_bins = {
+            k: v for k, v in matched.items()
+            if len(v) >= 2
+        }
+
+        # Compute per-device RSSI bias residuals
+        # For each shared (bssid, bin): group_median across all devices present,
+        # then each device's bias = its median for that bin - group_median.
+        device_bias: dict[str, list] = defaultdict(list)
+        device_rssi: dict[str, list] = defaultdict(list)
+
+        for (bssid, tbin), dev_map in shared_bins.items():
+            all_meds = []
+            dev_meds = {}
+            for dlabel, vals in dev_map.items():
+                med = float(np.median(vals))
+                dev_meds[dlabel] = med
+                all_meds.append(med)
+                device_rssi[dlabel].extend(vals)
+            group_med = float(np.median(all_meds))
+            for dlabel, med in dev_meds.items():
+                device_bias[dlabel].append(med - group_med)
+
+        header("SECTION 0 — PHONE-TO-PHONE RSSI BASELINE (EMPTY STADIUM TESTS)")
+        if cohort_total > 1:
+            print(f"\n  Cohort             : {cohort_index}/{cohort_total}")
+
+        # 0.0  Recording window
+        subheader("0.0  EMPTY Test Recording Window")
+        print(f"\n  Devices found       : {len(all_device_labels)}")
+        print(f"  Devices compared    : {len(device_labels)}")
+        excluded = [lbl for lbl in all_device_labels if lbl not in device_labels]
+        for lbl in all_device_labels:
+            dts = dt_by_device[lbl]
+            print(f"    {disp[lbl]:<40}  "
+                  f"{min(dts).strftime('%Y-%m-%d %H:%M:%S')} UTC  →  "
+                  f"{max(dts).strftime('%Y-%m-%d %H:%M:%S')} UTC  "
+                  f"({len(dts)} snapshots)")
+        if excluded:
+            print("\n  Excluded from this comparison (no overlap with this cohort):")
+            for lbl in excluded:
+                print(f"    {disp[lbl]}")
+
+        dur_min = (overlap_end - overlap_start).total_seconds() / 60
+        print(f"\n  Overlapping window  : {overlap_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"                        {overlap_end.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        print(f"  Duration            : {dur_min:.1f} minutes")
+        print(f"  Bin size            : {bin_sec}s")
+        band_note = band_filter if band_filter else "all bands"
+        print(f"  Band filter         : {band_note}")
+
+        snap_counts = defaultdict(int)
+        for m in snap_in_window.values():
+            snap_counts[m["device_label"]] += 1
+        print(f"\n  Snapshots in window per device:")
+        for lbl in device_labels:
+            print(f"    {disp[lbl]:<40}  {snap_counts[lbl]}")
+
+        print(f"\n  Shared (BSSID, time-bin) pairs with 2+ devices : {len(shared_bins)}")
+
+        # 0.1  Per-device descriptive RSSI statistics (matched scans only)
+        subheader("0.1  Per-Device RSSI Descriptive Statistics (matched scans)")
+        desc_headers = ["Device", "N", "Median", "Mean", "Std", "IQR", "P10", "P90"]
+        desc_rows = []
+        for lbl in device_labels:
+            arr = np.array(device_rssi.get(lbl, []))
+            if len(arr) == 0:
+                desc_rows.append([disp[lbl], 0, *["N/A"] * 6])
                 continue
-            wifi_by_snap[sid].append((bssid, rssi, band))
+            d = descriptive(arr)
+            desc_rows.append([
+                disp[lbl],
+                d["n"],
+                fmt(d["median"]),
+                fmt(d["mean"]),
+                fmt(d["std"]),
+                fmt(d["iqr"]),
+                fmt(d["p10"]),
+                fmt(d["p90"]),
+            ])
+        print()
+        print_table(desc_headers, desc_rows)
 
-    # ------------------------------------------------------------------
-    # Build matched scans:
-    # key: (bssid, time_bin) -> {device_label: [rssi, ...]}
-    matched: dict[tuple, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-
-    for sid, m in snap_in_window.items():
-        tbin = ts_bin(m["dt"], bin_sec)
-        dlabel = m["device_label"]
-        for bssid, rssi, band in wifi_by_snap.get(sid, []):
-            matched[(bssid, tbin)][dlabel].append(rssi)
-
-    # Keep only bins where 2+ devices are present
-    shared_bins = {
-        k: v for k, v in matched.items()
-        if len(v) >= 2
-    }
-
-    # ------------------------------------------------------------------
-    # Compute per-device RSSI bias residuals
-    # For each shared (bssid, bin): group_median across all devices present,
-    # then each device's bias = its median for that bin - group_median.
-    device_bias: dict[str, list] = defaultdict(list)
-    device_rssi: dict[str, list] = defaultdict(list)   # raw matched RSSI
-
-    for (bssid, tbin), dev_map in shared_bins.items():
-        all_meds = []
-        dev_meds = {}
-        for dlabel, vals in dev_map.items():
-            m = float(np.median(vals))
-            dev_meds[dlabel] = m
-            all_meds.append(m)
-            device_rssi[dlabel].extend(vals)
-        group_med = float(np.median(all_meds))
-        for dlabel, med in dev_meds.items():
-            device_bias[dlabel].append(med - group_med)
-
-    # ------------------------------------------------------------------
-    header("SECTION 0 — PHONE-TO-PHONE RSSI BASELINE (EMPTY STADIUM TESTS)")
-
-    # 0.0  Recording window
-    subheader("0.0  EMPTY Test Recording Window")
-    print(f"\n  Devices found       : {len(all_device_labels)}")
-    print(f"  Devices compared    : {len(device_labels)}")
-    excluded = [lbl for lbl in all_device_labels if lbl not in device_labels]
-    for lbl in all_device_labels:
-        dts = dt_by_device[lbl]
-        print(f"    {disp[lbl]:<40}  "
-              f"{min(dts).strftime('%Y-%m-%d %H:%M:%S')} UTC  →  "
-              f"{max(dts).strftime('%Y-%m-%d %H:%M:%S')} UTC  "
-              f"({len(dts)} snapshots)")
-    if excluded:
-        print("\n  Excluded from this comparison (no overlap with main cohort):")
-        for lbl in excluded:
-            print(f"    {disp[lbl]}")
-
-    dur_min = (overlap_end - overlap_start).total_seconds() / 60
-    print(f"\n  Overlapping window  : {overlap_start.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print(f"                        {overlap_end.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print(f"  Duration            : {dur_min:.1f} minutes")
-    print(f"  Bin size            : {bin_sec}s")
-    band_note = band_filter if band_filter else "all bands"
-    print(f"  Band filter         : {band_note}")
-
-    snap_counts = defaultdict(int)
-    for m in snap_in_window.values():
-        snap_counts[m["device_label"]] += 1
-    print(f"\n  Snapshots in window per device:")
-    for lbl in device_labels:
-        print(f"    {disp[lbl]:<40}  {snap_counts[lbl]}")
-
-    print(f"\n  Shared (BSSID, time-bin) pairs with 2+ devices : {len(shared_bins)}")
-
-    # ------------------------------------------------------------------
-    # 0.1  Per-device descriptive RSSI statistics (matched scans only)
-    subheader("0.1  Per-Device RSSI Descriptive Statistics (matched scans)")
-
-    desc_headers = ["Device", "N", "Median", "Mean", "Std", "IQR", "P10", "P90"]
-    desc_rows = []
-    for lbl in device_labels:
-        arr = np.array(device_rssi.get(lbl, []))
-        if len(arr) == 0:
-            desc_rows.append([disp[lbl], 0, *["N/A"] * 6])
-            continue
-        d = descriptive(arr)
-        desc_rows.append([
-            disp[lbl],
-            d["n"],
-            fmt(d["median"]),
-            fmt(d["mean"]),
-            fmt(d["std"]),
-            fmt(d["iqr"]),
-            fmt(d["p10"]),
-            fmt(d["p90"]),
-        ])
-    print()
-    print_table(desc_headers, desc_rows)
-
-    # ------------------------------------------------------------------
-    # 0.2  Per-device RSSI bias (relative to group median per BSSID/bin)
-    subheader("0.2  Per-Device RSSI Bias (dB relative to per-bin group median)")
-    print("""
+        # 0.2  Per-device RSSI bias (relative to group median per BSSID/bin)
+        subheader("0.2  Per-Device RSSI Bias (dB relative to per-bin group median)")
+        print("""
   A positive bias means the device tends to REPORT HIGHER RSSI than the
   median of all co-located devices for the same AP in the same time window.
   A negative bias means it reports LOWER RSSI.
 """)
 
-    bias_headers = ["Device", "N pairs", "Median bias", "Mean bias",
-                    "Std", "P10", "P90", "Interpretation"]
-    bias_rows = []
-    bias_arrays = {}
-    for lbl in device_labels:
-        arr = np.array(device_bias.get(lbl, []))
-        bias_arrays[lbl] = arr
-        if len(arr) == 0:
-            bias_rows.append([disp[lbl], 0, *["N/A"] * 5, "no data"])
-            continue
-        d = descriptive(arr)
-        med = d["median"]
-        if abs(med) < 0.5:
-            interp = "near-neutral"
-        elif med > 0:
-            interp = f"reports ~{abs(med):.1f} dB HIGHER"
-        else:
-            interp = f"reports ~{abs(med):.1f} dB lower"
-        bias_rows.append([
-            disp[lbl],
-            d["n"],
-            fmt(d["median"], 2),
-            fmt(d["mean"], 2),
-            fmt(d["std"], 2),
-            fmt(d["p10"], 2),
-            fmt(d["p90"], 2),
-            interp,
-        ])
-    print()
-    print_table(bias_headers, bias_rows)
-
-    # ------------------------------------------------------------------
-    # 0.3  Kruskal-Wallis across all devices
-    subheader("0.3  Kruskal-Wallis Test (are any devices significantly different?)")
-
-    valid_labels = [lbl for lbl in device_labels
-                    if len(bias_arrays.get(lbl, [])) > 0]
-    groups = [bias_arrays[lbl] for lbl in valid_labels]
-
-    if len(groups) < 2:
-        print("\n  Not enough devices with data for Kruskal-Wallis.")
-    else:
-        H, p_kw = kruskal_wallis(*groups)
-        print(f"\n  H = {H:.4f},  p = {fmt_p(p_kw)} {sig_stars(p_kw)}")
-        if p_kw < 0.05:
-            print("  → At least one device reports significantly different RSSI "
-                  "from the others (p < 0.05).")
-        else:
-            print("  → No statistically significant difference detected across "
-                  "devices (p ≥ 0.05).")
-
-    # ------------------------------------------------------------------
-    # 0.4  Pairwise comparisons (Mann-Whitney + Bonferroni)
-    subheader("0.4  Pairwise Device Comparisons (Mann-Whitney, Bonferroni corrected)")
-
-    pairs = list(combinations(valid_labels, 2))
-    n_pairs = len(pairs)
-    if n_pairs == 0:
-        print("\n  Not enough device pairs with data for pairwise comparisons.")
-    else:
-        print(f"\n  {n_pairs} pairs, Bonferroni α = {0.05/n_pairs:.4f}\n")
-
-    pair_headers = ["Device A", "Device B", "Δ median (B−A)",
-                    "95% CI", "U", "p (raw)", "p (adj)", "sig", "Cliff's δ", "effect"]
-    pair_rows = []
-    if n_pairs > 0:
-        for la, lb in pairs:
-            aa = bias_arrays[la]
-            ab = bias_arrays[lb]
-            obs, ci_lo, ci_hi = bootstrap_median_ci(aa, ab)
-            U, p_raw = mannwhitney(aa, ab)
-            p_adj = min(p_raw * n_pairs, 1.0)
-            cd = cliffs_delta(aa, ab)
-            pair_rows.append([
-                disp[la],
-                disp[lb],
-                f"{obs:+.2f} dB",
-                f"[{ci_lo:+.2f}, {ci_hi:+.2f}]",
-                f"{U:.0f}",
-                fmt_p(p_raw),
-                fmt_p(p_adj),
-                sig_stars(p_adj),
-                f"{cd:+.3f}",
-                effect_label_cliff(cd),
+        bias_headers = ["Device", "N pairs", "Median bias", "Mean bias",
+                        "Std", "P10", "P90", "Interpretation"]
+        bias_rows = []
+        bias_arrays = {}
+        for lbl in device_labels:
+            arr = np.array(device_bias.get(lbl, []))
+            bias_arrays[lbl] = arr
+            if len(arr) == 0:
+                bias_rows.append([disp[lbl], 0, *["N/A"] * 5, "no data"])
+                continue
+            d = descriptive(arr)
+            med = d["median"]
+            if abs(med) < 0.5:
+                interp = "near-neutral"
+            elif med > 0:
+                interp = f"reports ~{abs(med):.1f} dB HIGHER"
+            else:
+                interp = f"reports ~{abs(med):.1f} dB lower"
+            bias_rows.append([
+                disp[lbl],
+                d["n"],
+                fmt(d["median"], 2),
+                fmt(d["mean"], 2),
+                fmt(d["std"], 2),
+                fmt(d["p10"], 2),
+                fmt(d["p90"], 2),
+                interp,
             ])
-        print_table(pair_headers, pair_rows)
+        print()
+        print_table(bias_headers, bias_rows)
 
-    # ------------------------------------------------------------------
-    # 0.5  Summary / interpretation
-    subheader("0.5  Summary")
+        # 0.3  Kruskal-Wallis across all devices
+        subheader("0.3  Kruskal-Wallis Test (are any devices significantly different?)")
+        valid_labels = [lbl for lbl in device_labels
+                        if len(bias_arrays.get(lbl, [])) > 0]
+        groups = [bias_arrays[lbl] for lbl in valid_labels]
 
-    sig_pairs = [(la, lb, row) for (la, lb), row in zip(pairs, pair_rows)
-                 if row[7] != "ns"]
-    print()
-    if not sig_pairs:
-        print("  No pairwise differences survive Bonferroni correction.")
-        print("  Devices appear to report consistent RSSI for the same APs.")
-    else:
-        print(f"  {len(sig_pairs)} pairwise difference(s) survive Bonferroni correction:")
-        for la, lb, row in sig_pairs:
-            print(f"    {disp[la]}  vs  {disp[lb]}")
-            print(f"      Δ median = {row[2]}  CI = {row[3]}  "
-                  f"p_adj = {row[6]}  Cliff's δ = {row[8]} ({row[9]})")
+        if len(groups) < 2:
+            print("\n  Not enough devices with data for Kruskal-Wallis.")
+        else:
+            H, p_kw = kruskal_wallis(*groups)
+            print(f"\n  H = {H:.4f},  p = {fmt_p(p_kw)} {sig_stars(p_kw)}")
+            if p_kw < 0.05:
+                print("  → At least one device reports significantly different RSSI "
+                      "from the others (p < 0.05).")
+            else:
+                print("  → No statistically significant difference detected across "
+                      "devices (p ≥ 0.05).")
 
-    # Rank devices by median bias (reference = device with bias closest to 0)
-    ranked = sorted(
-        [(lbl, float(np.median(bias_arrays[lbl])))
-         for lbl in valid_labels if len(bias_arrays[lbl]) > 0],
-        key=lambda x: x[1]
-    )
-    if ranked:
-        print(f"\n  Devices ranked low→high by median bias (dB vs group median):")
-        for lbl, med in ranked:
-            print(f"    {disp[lbl]:<40}  {med:+.2f} dB")
+        # 0.4  Pairwise comparisons (Mann-Whitney + Bonferroni)
+        subheader("0.4  Pairwise Device Comparisons (Mann-Whitney, Bonferroni corrected)")
+
+        pairs = list(combinations(valid_labels, 2))
+        n_pairs = len(pairs)
+        if n_pairs == 0:
+            print("\n  Not enough device pairs with data for pairwise comparisons.")
+        else:
+            print(f"\n  {n_pairs} pairs, Bonferroni α = {0.05/n_pairs:.4f}\n")
+
+        pair_headers = ["Device A", "Device B", "Δ median (B−A)",
+                        "95% CI", "U", "p (raw)", "p (adj)", "sig", "Cliff's δ", "effect"]
+        pair_rows = []
+        if n_pairs > 0:
+            for la, lb in pairs:
+                aa = bias_arrays[la]
+                ab = bias_arrays[lb]
+                obs, ci_lo, ci_hi = bootstrap_median_ci(aa, ab)
+                U, p_raw = mannwhitney(aa, ab)
+                p_adj = min(p_raw * n_pairs, 1.0)
+                cd = cliffs_delta(aa, ab)
+                pair_rows.append([
+                    disp[la],
+                    disp[lb],
+                    f"{obs:+.2f} dB",
+                    f"[{ci_lo:+.2f}, {ci_hi:+.2f}]",
+                    f"{U:.0f}",
+                    fmt_p(p_raw),
+                    fmt_p(p_adj),
+                    sig_stars(p_adj),
+                    f"{cd:+.3f}",
+                    effect_label_cliff(cd),
+                ])
+            print_table(pair_headers, pair_rows)
+
+        # 0.5  Summary / interpretation
+        subheader("0.5  Summary")
+
+        sig_pairs = [(la, lb, row) for (la, lb), row in zip(pairs, pair_rows)
+                     if row[7] != "ns"]
+        print()
+        if not sig_pairs:
+            print("  No pairwise differences survive Bonferroni correction.")
+            print("  Devices appear to report consistent RSSI for the same APs.")
+        else:
+            print(f"  {len(sig_pairs)} pairwise difference(s) survive Bonferroni correction:")
+            for la, lb, row in sig_pairs:
+                print(f"    {disp[la]}  vs  {disp[lb]}")
+                print(f"      Δ median = {row[2]}  CI = {row[3]}  "
+                      f"p_adj = {row[6]}  Cliff's δ = {row[8]} ({row[9]})")
+
+        ranked = sorted(
+            [(lbl, float(np.median(bias_arrays[lbl])))
+             for lbl in valid_labels if len(bias_arrays[lbl]) > 0],
+            key=lambda x: x[1]
+        )
+        if ranked:
+            print(f"\n  Devices ranked low→high by median bias (dB vs group median):")
+            for lbl, med in ranked:
+                print(f"    {disp[lbl]:<40}  {med:+.2f} dB")
+
+    for idx, (labels, overlap_start, overlap_end) in enumerate(cohort_specs, 1):
+        if idx > 1:
+            print("\n" + "-" * 78)
+        run_cohort(labels, overlap_start, overlap_end, idx, len(cohort_specs))
 
     # ------------------------------------------------------------------
     # 0.5b  All feasible pairwise comparisons (across separate EMPTY sessions)
@@ -878,8 +896,8 @@ def main():
     parser.add_argument("--bin-sec", type=int, default=DEFAULT_BIN_SEC,
                         help=f"Time-bin width in seconds (default: {DEFAULT_BIN_SEC})")
     parser.add_argument("--band",    default=None,
-                        choices=["2.4GHz", "5GHz", "6GHz"],
-                        help="Restrict to a single Wi-Fi band (default: all)")
+                        choices=["all", "2.4GHz", "5GHz", "6GHz"],
+                        help="Band mode: default runs 5GHz then 6GHz separately; use 'all' to combine")
     parser.add_argument("--aliases", default=ALIASES_DEFAULT,
                         help=f"device_aliases.json path (default: {ALIASES_DEFAULT})")
     args = parser.parse_args()
@@ -893,7 +911,20 @@ def main():
     OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     with output_to(OUT_FILE):
-        run(db_path, args.bin_sec, args.band, aliases)
+        if args.band is None:
+            print("Running separate RSSI analyses for 5GHz and 6GHz to avoid mixed-band skew.\n")
+            print("#" * 78)
+            print("# PASS 1: 5GHz only")
+            print("#" * 78)
+            run(db_path, args.bin_sec, "5GHz", aliases)
+            print("\n" + "#" * 78)
+            print("# PASS 2: 6GHz only")
+            print("#" * 78)
+            run(db_path, args.bin_sec, "6GHz", aliases)
+        elif args.band == "all":
+            run(db_path, args.bin_sec, None, aliases)
+        else:
+            run(db_path, args.bin_sec, args.band, aliases)
 
     print(f"\nOutput saved to: {OUT_FILE}")
 
